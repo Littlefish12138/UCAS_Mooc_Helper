@@ -32,10 +32,7 @@ def run_video_task_with_ui(launch_func: function, course_url, log_callback=None,
     try:
         # 启动浏览器
         page: ChromiumPage = launch_func()
-
-        # 打开课程页面
         page.get(course_url)
-        time.sleep(3)
 
         # 无痕模式下等待用户登录
         if login_callback is not None:

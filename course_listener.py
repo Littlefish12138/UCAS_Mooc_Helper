@@ -177,13 +177,13 @@ class CoursePageHandler:
     def click_play_button(page: ChromiumPage, log_callback:function):
         """点击初始播放按钮"""
         try:
-            play_button = page.ele(f"css:{PageConfig.PLAY_BUTTON}")
+            play_button = page.ele(f"css:{PageConfig.PLAY_BUTTON}",timeout=5)
             if play_button:
                 play_button.click()
                 log_callback("已点击播放按钮")
                 return True
             else:
-                log_callback("未找到播放按钮，可能已自动播放")
+                log_callback("未找到播放按钮")
                 return False
         except Exception as e:
             log_callback(f"点击播放按钮异常: {e}")
@@ -289,22 +289,25 @@ def run_video_task(page: ChromiumPage, handler: CoursePageHandler, log_callback:
             log("该视频已完成，跳过")
             continue
 
-        # 点击播放按钮
-        handler.click_play_button(page, log)
+        # 通过尝试点击播放按钮，判断是否为视频
+        is_video = handler.click_play_button(page, log)
 
-        # 获取监控线程
-        monitor_thread, stop_event = handler.start_playback_monitor(page,log)
-        
-        # 等待完成图片
-        success = handler.listen_complete_image(page,log)
+        if is_video:
+            # 获取监控线程
+            monitor_thread, stop_event = handler.start_playback_monitor(page,log)
+            
+            # 等待完成图片
+            success = handler.listen_complete_image(page,log)
 
-        # 停止监控
-        stop_event.set()
-        monitor_thread.join()
+            # 停止监控
+            stop_event.set()
+            monitor_thread.join()
 
-        if not success:
-            log("视频播放超时，等待进行重试")
-            tasks.append((chap_idx, vid_idx))
+            if not success:
+                log("视频播放超时，等待进行重试")
+                tasks.append((chap_idx, vid_idx))
+        else:
+            continue
 
         time.sleep(1)
 

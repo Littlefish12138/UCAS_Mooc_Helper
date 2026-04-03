@@ -1,3 +1,7 @@
 __pycache__/course_listener.cpython-314.pyc
 __pycache__/utils.cpython-314.pyc
 __pycache__
+UCAS_MOOC_Helper.spec
+dist/
+venv/
+build/
