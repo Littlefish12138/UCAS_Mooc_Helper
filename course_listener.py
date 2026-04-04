@@ -27,10 +27,19 @@ class PageConfig:
     VIDEO_LINK_CONTAINER = ".ncells a"
     # 已完成图标（视频页面）
     COMPLETED_ICON = "#ext-gen1051"  # 或 '.ans-job-icon.ans-job-icon-clear'
+
+    # 是否为视频
+    IS_VIDEO = ".video-js"
+
+    # 视频播放状态(是否已经播放过)关键字
+    PLAY_STATUS = ".vjs-has-started"
+    # 视频当前播放状态关键字
+    IS_PAUSED = ".vjs-paused" # 表示暂停
     # 播放按钮（初始播放）
     PLAY_BUTTON = "#video > button"  # 可改为 '.vjs-big-play-button'
-    # 播放/暂停控制按钮（用于恢复播放）
+    # 播放/暂停控制按钮（用于已开始播放）
     PLAY_PAUSE_CONTROL = ".vjs-play-control"
+
     # 任务完成图片请求关键字
     COMPLETE_IMAGE_KEYWORD = "job-status-new-complete"
 
@@ -147,8 +156,8 @@ class CoursePageHandler:
         return page.run_js(js)
 
     @staticmethod
-    def click_video_by_index(page: ChromiumPage, chap_index, video_index):
-        """点击指定章节下的指定视频"""
+    def click_by_index(page: ChromiumPage, chap_index, video_index):
+        """点击指定章节下的指定内容"""
         js = f"""
             var cellsList = document.querySelectorAll('{PageConfig.CHAPTER_CONTAINER}');
             if (cellsList.length < {chap_index}) return false;
@@ -160,6 +169,14 @@ class CoursePageHandler:
             return true;
         """
         return page.run_js(js)
+    
+    @staticmethod
+    def is_video(page: ChromiumPage):
+        """判断是否为视频"""
+        if page.ele(f"css:{PageConfig.IS_VIDEO}",timeout=3):
+            return True
+        else:
+            return False
 
     @staticmethod
     def is_video_completed(page: ChromiumPage) -> bool:
@@ -174,16 +191,33 @@ class CoursePageHandler:
         return False
 
     @staticmethod
-    def click_play_button(page: ChromiumPage, log_callback:function):
-        """点击初始播放按钮"""
+    def click_play_button(page: ChromiumPage, log_callback: function):
+        """
+        确保视频开始播放。如果已播放则无操作，否则点击播放按钮。
+        返回 True 表示视频已可播放，False 表示无法处理。
+        """
         try:
-            play_button = page.ele(f"css:{PageConfig.PLAY_BUTTON}",timeout=5)
+            # 1. 先判断视频是否正在播放（.vjs-paused 存在表示暂停，不存在表示播放中）
+            is_paused = page.ele(f"css:{PageConfig.IS_PAUSED}", timeout=4)
+            if not is_paused:
+                log_callback("视频已在播放中")
+                return True
+
+            # 2. 视频处于暂停状态（包括未开始）
+            play_status = page.ele(f"css:{PageConfig.PLAY_STATUS}")
+            if play_status:
+                play_button = page.ele(f"css:{PageConfig.PLAY_PAUSE_CONTROL}")
+                action_msg = "恢复播放"
+            else:
+                play_button = page.ele(f"css:{PageConfig.PLAY_BUTTON}", timeout=5)
+                action_msg = "开始播放"
+
             if play_button:
                 play_button.click()
-                log_callback("已点击播放按钮")
+                log_callback(action_msg)
                 return True
             else:
-                log_callback("未找到播放按钮")
+                log_callback("错误：未找到播放按钮")
                 return False
         except Exception as e:
             log_callback(f"点击播放按钮异常: {e}")
@@ -201,14 +235,11 @@ class CoursePageHandler:
         def monitor():
             while not stop_event.is_set():
                 try:
-                    play_btn = page.ele(f"css:{PageConfig.PLAY_PAUSE_CONTROL}", timeout=2)
-                    if play_btn:
-                        title = play_btn.attr('title')
-                        if title == "播放":
-                            play_btn.click()
-                            log_callback("检测到视频暂停，已重新播放")
+                    is_paused = page.ele(f"css:{PageConfig.IS_PAUSED}", timeout=4)
+                    if is_paused:
+                        CoursePageHandler.click_play_button(page, log_callback)
                 except Exception as e:
-                    log_callback(f"错误: {e}")
+                    log_callback(f"监控器异常: {e}")
                 # 分段睡眠以便及时响应停止事件
                 for _ in range(monitor_interval):
                     if stop_event.is_set():
@@ -276,7 +307,7 @@ def run_video_task(page: ChromiumPage, handler: CoursePageHandler, log_callback:
         log(f"\n正在处理第 {chap_idx} 章第 {vid_idx} 个视频...")
 
         # 点击视频
-        if not handler.click_video_by_index(page, chap_idx, vid_idx):
+        if not handler.click_by_index(page, chap_idx, vid_idx):
             log(f"点击视频失败，将重新加入队列")
             tasks.append((chap_idx, vid_idx))
             time.sleep(2)
@@ -284,28 +315,32 @@ def run_video_task(page: ChromiumPage, handler: CoursePageHandler, log_callback:
 
         time.sleep(4)  # 等待页面刷新
 
+        # 检查是否为视频
+        if not handler.is_video(page):
+            log("当前章节不是视频，跳过")
+            continue
+
         # 检查是否已完成
         if handler.is_video_completed(page):
             log("该视频已完成，跳过")
             continue
 
-        # 通过尝试点击播放按钮，判断是否为视频
-        is_video = handler.click_play_button(page, log)
+        # 开始播放
+        handler.click_play_button(page, log)
 
-        if is_video:
-            # 获取监控线程
-            monitor_thread, stop_event = handler.start_playback_monitor(page,log)
-            
-            # 等待完成图片
-            success = handler.listen_complete_image(page,log)
+        # 获取监控线程
+        monitor_thread, stop_event = handler.start_playback_monitor(page,log)
+        
+        # 等待完成图片
+        success = handler.listen_complete_image(page,log)
 
-            # 停止监控
-            stop_event.set()
-            monitor_thread.join()
+        # 停止监控
+        stop_event.set()
+        monitor_thread.join()
 
-            if not success:
-                log("视频播放超时，等待进行重试")
-                tasks.append((chap_idx, vid_idx))
+        if not success:
+            log("视频播放超时，等待进行重试")
+            tasks.append((chap_idx, vid_idx))
         else:
             continue
 
