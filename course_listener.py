@@ -11,7 +11,10 @@ import time
 import subprocess
 import threading
 from collections import deque
+import os
+import json
 from DrissionPage import ChromiumPage, ChromiumOptions
+from DrissionPage._elements.chromium_element import ChromiumElement
 
 import utils
 # ================== 配置区域（选择器、关键字等） ==================
@@ -25,8 +28,8 @@ class PageConfig:
     CHAPTER_TITLE = "#coursetree .cells > h3"
     # 视频链接容器
     VIDEO_LINK_CONTAINER = ".ncells a"
-    # 已完成图标（视频页面）
-    COMPLETED_ICON = "#ext-gen1051"  # 或 '.ans-job-icon.ans-job-icon-clear'
+    # 查找页面上 任务点是否完成 对应字样的查找方式，用class以ans-job-icon开头来查找
+    IS_COMPLETED = '^ans-job-icon'
 
     # 是否为视频
     IS_VIDEO = ".video-js"
@@ -42,6 +45,32 @@ class PageConfig:
 
     # 任务完成图片请求关键字
     COMPLETE_IMAGE_KEYWORD = "job-status-new-complete"
+
+
+    # 章节测验按钮的selector
+    QUESTION_BUTTON = '#dct2'
+    # 章节测验按钮被点击时，对应的属性名
+    CLICK_STATUS = 'class'
+    CLICKED = 'c2 currents'
+
+    # 试题容器class名
+    QUESTION_BOX = ".TiMu singleQuesId"
+    # 题干容器class属性名
+    STEM_BOX = 'Zy_TItle clearfix'
+    # 题干的查找方式，容器class 名为clearfix 或者是 clearfix font-cxsecret fontLabel
+    STEM_TEXT = '.^clearfix'
+    # 选项的查找方式，找href属性 已完成时为 javascript:void(0) 未完成时后面多一个分号
+    OPTIONS_HREF = '^javascript:void(0)'
+    # 已经回答的问题，答案容器class属性名
+    ANSWER_BOX = 'Py_answer clearfix'
+    MY_ANSWER = 'span' # 我的答案位置
+    IS_CORRECT_BOX = '.^fr'   # 答案是否正确，对应的class属性，正确时为 fr dui，错误时为 fr cuo
+    IS_CORRECT = 'aria-label' # 答案是否正确，对应字符串的属性名
+
+    # 提交答案按钮的selector
+    SUBMIT_BUTTON = '#RightCon > div.radiusBG > div > div.ZY_sub.clearfix > a.Btn_blue_1.marleft10.workBtnIndex'
+    # 确定提交答案按钮的selector
+    CONFIRM_BUTTON = '#confirmSubWin > div > div > a.bluebtn'
 
 # ================== 浏览器启动器 ==================
 class BrowserLauncher:
@@ -179,16 +208,16 @@ class CoursePageHandler:
             return False
 
     @staticmethod
-    def is_video_completed(page: ChromiumPage) -> bool:
+    def is_completed(page: ChromiumPage) -> bool | None:
         """
-        判断当前视频是否已完成\n
+        判断当前视频是否播放完成/章节测试题是否已提交\n
         方法为检查是否存在“任务点已完成”字样
         """
-        icon = page.ele(PageConfig.COMPLETED_ICON, timeout=2)
+        icon = page.ele(f".{PageConfig.IS_COMPLETED}", timeout=2)
         if icon:
             aria_label = icon.attr('aria-label')
             return aria_label == "任务点已完成"
-        return False
+        return None
 
     @staticmethod
     def click_play_button(page: ChromiumPage, log_callback: function):
@@ -222,7 +251,7 @@ class CoursePageHandler:
         except Exception as e:
             log_callback(f"点击播放按钮异常: {e}")
             return False
-
+    
     @staticmethod
     def start_playback_monitor(page: ChromiumPage, log_callback: function, monitor_interval=50):
         """
@@ -265,6 +294,164 @@ class CoursePageHandler:
             return True
         else:
             log_callack("等待超时，未收到完成图片")
+            return False
+    
+    @staticmethod
+    def get_to_questions(page: ChromiumPage, log_callback: function=print):
+        """
+        通过点击，切换到章节测试的部分，返回是否点击成功
+        """
+        ques_btn = page.ele(f"css:{PageConfig.QUESTION_BUTTON}")
+        if ques_btn:
+            if ques_btn.attr(f"{PageConfig.CLICK_STATUS}") == PageConfig.CLICKED:
+                log_callback("已经在章节测试当中")
+                return True
+            else:
+                log_callback("点击章节测试按钮")
+                ques_btn.click()
+                return True
+        else:
+            log_callback("错误：未找到章节测试对应的按钮")
+            return False
+        
+    @staticmethod
+    def get_stem(question_box: ChromiumElement, log_callback: function) -> str:
+        """
+        获取题干字符串\n
+        """
+        child = question_box.child(f".{PageConfig.STEM_BOX}")
+        stem_elem = child.ele(PageConfig.STEM_TEXT)   # 获取题干容器
+        if stem_elem:
+            stem_text = stem_elem.text
+            if stem_text:
+                return stem_text
+            else:
+                log_callback("错误：题干内容为空")
+        else:
+            log_callback("错误：题干元素不存在或class属性变化")
+            return None
+    
+    @staticmethod
+    def get_options(question_box: ChromiumElement, log_callback: function) -> list:
+        """获取选项内容,将每个选项内容(不包含选项名A,B,C,D)以列表形式返回"""
+        options_list = []
+        option_elems = question_box.eles(f"@href{PageConfig.OPTIONS_HREF}") # 获取选项元素列表
+        if option_elems:
+            for option_elem in option_elems:
+                option_elem: ChromiumElement
+                options_list.append(option_elem.text)
+        else:
+            log_callback("错误：选项元素不存在或href属性变化")
+        return options_list
+    
+    @staticmethod
+    def get_answer_and_result(question_box: ChromiumElement, log_callback: function) -> tuple[str | None,bool | None]:
+        """
+        获取我的回答及答案是否正确\n
+        返回的str是选项名'CD'或者'对'/'错'
+        """
+        answer_box, is_correct = None, None
+        answer_box = question_box.child(f".{PageConfig.ANSWER_BOX}")
+        if answer_box:
+            # 获取回答字符串，预期格式为  我的答案：A
+            # 获取之后将冒号连同之前的东西全部去掉
+            my_answer: str = answer_box.child(f"css:{PageConfig.MY_ANSWER}").text
+            my_answer = my_answer.split("：", 1)[1].strip()
+
+
+            correct_elem = answer_box.child(f"{PageConfig.IS_CORRECT_BOX}")
+            if correct_elem:
+                is_correct = (correct_elem.attr(PageConfig.IS_CORRECT) == '答案正确')
+            else:
+                log_callback("错误：未找到是否正确对应的元素")
+        else:
+            log_callback("错误：我的回答元素不存在或class属性变化")
+        
+        return my_answer, is_correct
+
+        
+    @staticmethod
+    def get_questions(page: ChromiumPage, log_callback: function) -> list[dict]:
+        """
+        获取一个页面中的试题和答案，\n
+        :param page: 要求已经访问章节测试页面
+        :return: 试题字典列表，每个试题字典格式\n
+                {
+                    "question": 题干文本,字符串
+                    "data": 题目的 data
+                    "options": [选项列表],选项形如字符串'军队'(不带选项名), 判断题此项为None
+                    "my_answer": 为选择题则为选择的选项字符串列表(不带选项名)，为判断题则为字符串
+                    "is_correct": 已回答则为bool值, 未回答则为None
+                }
+        """
+        question_list = []
+        # 获取所有题目容器
+        question_boxes = page.eles(PageConfig.QUESTION_BOX)
+        for idx, q_box in enumerate(question_boxes, start=1):
+            q_box: ChromiumElement
+            log_callback(f"正在解析第 {idx} 题...")
+            question_info = {
+                "question": "",
+                "data": 0, 
+                "options": None,
+                "my_answer": None,
+                "is_correct": None,
+            }
+
+            question_str = CoursePageHandler.get_stem(q_box,log_callback)
+            question_info['question'] = question_str
+
+            question_info['data'] = q_box.attr("data") if q_box.attr("data") else None
+            
+            is_mcq = question_str.startswith(("【单选题】","【多选题】")) # 判断是否为选择题           
+
+            if is_mcq:
+                options = CoursePageHandler.get_options(q_box,log_callback)
+                question_info["options"] = options
+
+            if CoursePageHandler.is_completed(page) is True:
+                my_answer, is_correct = CoursePageHandler.get_answer_and_result(q_box,log_callback)
+
+                question_info["is_correct"] = is_correct
+                if is_mcq:  # 选择题将选项字母替换成对应的选项内容
+                    my_answer_list = []
+                    for _ in my_answer:
+                        my_answer_list.append(options[ord(_) - ord('A')])
+                    question_info["my_answer"] = my_answer_list
+                else:
+                    question_info["my_answer"] = my_answer
+                    
+            question_list.append(question_info)
+        
+        return question_list
+
+    @staticmethod
+    def answer_questions(page: ChromiumPage,answer: list[dict]):
+        """
+        回答试题，要求输入已经访问对应视频页面的ChromiumPage对象\n
+        :param answer: 试题答案，要求为列表
+        """
+        pass
+
+    @staticmethod
+    def submit_answers(page: ChromiumPage, log_callback: function):
+        """
+        提交答案
+        """
+        submit_button = page.ele(f"css:{PageConfig.SUBMIT_BUTTON}")
+        if submit_button:
+            submit_button.click()
+            time.sleep(2)
+            confirm_button = page.ele(f"css:{PageConfig.CONFIRM_BUTTON}")
+            if confirm_button:
+                confirm_button.click()
+                log_callback("已经提交答案")
+                return True
+            else:
+                log_callback("错误：未找到确定提交按钮")
+                return False
+        else:
+            log_callback("错误，未找到提交按钮")
             return False
 
 # ================== 主业务函数 ==================
@@ -321,7 +508,7 @@ def run_video_task(page: ChromiumPage, handler: CoursePageHandler, log_callback:
             continue
 
         # 检查是否已完成
-        if handler.is_video_completed(page):
+        if handler.is_completed(page):
             log("该视频已完成，跳过")
             continue
 
@@ -350,13 +537,71 @@ def run_video_task(page: ChromiumPage, handler: CoursePageHandler, log_callback:
     if log_callback is None:
         input("按回车退出...")
 
+def save_all_questions(page: ChromiumPage, handler: CoursePageHandler, log_callback: function):
+    """
+    遍历所有视频的章节测试，以字典形式保存所有试题\n
+    键是data，值是题目信息，包括题干，选项等等
+    """
+    # 日志回调/直接输出到控制台
+    def log(msg):
+        if log_callback is not None:
+            log_callback(msg)
+        else:
+            print(msg)
+
+        # 获取视频数量
+    video_counts = handler.get_chapter_video_counts(page)
+    total_chapters = len(video_counts)
+    log(f"检测到 {total_chapters} 章")
+
+    if total_chapters == 0:
+        log("未检测到章节，请检查页面结构")
+        return
+
+    # 构建任务队列
+    tasks = deque()
+    for chap_idx in range(1, total_chapters + 1):
+        video_num = video_counts[chap_idx - 1]
+        log(f"第 {chap_idx} 章共有 {video_num} 个视频")
+        for vid_idx in range(1, video_num + 1):
+            tasks.append((chap_idx, vid_idx))
+
+    log(f"总任务数: {len(tasks)}")
+    log("开始处理任务队列...\n")
+
+    question_dict_list = []
+
+    while tasks:
+        chap_idx, vid_idx = tasks.popleft()
+        log(f"\n正在处理第 {chap_idx} 章第 {vid_idx} 个视频...")
+
+        # 点击视频
+        if not handler.click_by_index(page, chap_idx, vid_idx):
+            log(f"点击视频失败，将重新加入队列")
+            tasks.append((chap_idx, vid_idx))
+            time.sleep(2)
+            continue
+        time.sleep(4)  # 等待页面刷新
+
+        if not handler.is_video(page):
+            log("当前章节不是视频，跳过")
+            continue
+
+        handler.get_to_questions(page,log)
+        question_dict_list.extend(handler.get_questions(page,log))
+    
+    question_dict = {d["data"]: d for d in question_dict_list}
+
+    base_dir = os.path.abspath(os.path.dirname(__file__))
+    output_dir = os.path.join(base_dir,'_questions','军事理论20260411.json')
+    os.makedirs(os.path.dirname(output_dir), exist_ok=True)
+
+    with open(output_dir, 'w', encoding='utf-8') as f:
+        json.dump(question_dict, f, ensure_ascii=False, indent=2)
+
 if __name__ == "__main__":
-    page = BrowserLauncher.launch_with_user_data(
-        browser_type='edge',
-        browser_path=utils.get_edge_path(),
-        user_data_dir=utils.get_edge_user_data_dir()
-        )
-    url = input("输入课程链接")
-    page.get(url)
+
+    page = BrowserLauncher.launch_with_user_data(user_data_dir=utils.get_edge_user_data_dir())
+    page.get("https://mooc.mooc.ucas.edu.cn/mooc-ans/mycourse/studentstudy?chapterId=577472&courseId=350140000037227&clazzid=350140000031973&enc=f1220c4fcaa1db6d27eefea233837606")
     handler = CoursePageHandler()
-    run_video_task(page, CoursePageHandler)
+    save_all_questions(page,handler,print)
