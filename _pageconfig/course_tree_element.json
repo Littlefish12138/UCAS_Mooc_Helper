@@ -6,10 +6,6 @@
     "type": ["ele"],
     "locator": ["#coursetree", ".onetoone"]
   },
-  "virtual_dict": {
-    "key": "chapters",
-    "container": "$root"
-  },
   "sub_elements": [
     {
       "name": "chapter",
@@ -20,7 +16,7 @@
       },
       "virtual_dict": {
         "key": "chapters",
-        "container": "$parent"
+        "container": "$root"
       },
       "sub_elements": [
         {
@@ -30,17 +26,27 @@
             "type": ["child", "ele"],
             "locator": ["tag:h3"]
           },
-          "targets": {
-            "chapter_title": {
-              "type": "information",
-              "container": "$parent",
-              "description": "一章的标题",
-              "key": "title",
-              "value": {
-                "method": "raw_text"
+          "sub_elements": [
+            {
+              "name": "chapter_title_span",
+              "description": "一章的标题子元素",
+              "locator_method": {
+                "type": ["ele"],
+                "locator": ["tag:span", ".titlewords"]
+              },
+              "targets": {
+                "title": {
+                  "type": "information",
+                  "description": "一章的标题",
+                  "container": "$parent",
+                  "key": "title",
+                  "value": {
+                    "method": "raw_text"
+                  }
+                }
               }
             }
-          }
+          ]
         },
         {
           "name": "section",
@@ -59,7 +65,7 @@
               "name": "titie",
               "description": "一节视频的标题和href所在元素",
               "locator_method": {
-                "type": ["child", "ele"],
+                "type": ["ele"],
                 "locator": ["tag:a"]
               },
               "targets": {
