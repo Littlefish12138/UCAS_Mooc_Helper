@@ -119,6 +119,7 @@
     {
       "name": "my_answer_parent",
       "description": "我的答案父元素",
+      "presence": "optional",
       "locator_method": {
         "type": ["child", "ele"],
         "locator": [".Py_answer clearfix"]
@@ -136,7 +137,7 @@
               "type": "information",
               "description": "我的答案",
               "container": "questions",
-              "key": "myAnswer",
+              "key": "my_answer",
               "value": {
                 "method": "text"
               }
