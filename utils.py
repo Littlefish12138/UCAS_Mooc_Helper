@@ -146,17 +146,20 @@ def launch_browser(browser_type: str, user_data_dir: str = None, is_incognito = 
     else:
         raise ValueError(f"错误的浏览器类型{browser_type}")
     
-    if user_data_dir:
-        co.set_user_data_path(user_data_dir)
+    if is_incognito is False:
+        if user_data_dir:
+            co.set_user_data_path(user_data_dir)
+        else:
+            if browser_type == 'chrome':
+                raise ValueError("当浏览器类型为chrome时, 不允许使用默认数据目录")
+            co.set_user_data_path(get_user_data_path(browser_type))
+        
+        if user_data_dir == get_user_data_path(browser_type):
+            kill_browser_process(browser_type)
     else:
-        if browser_type == 'chrome':
-            raise ValueError("当浏览器类型为chrome时, 不允许使用默认数据目录")
-        co.set_user_data_path(get_user_data_path(browser_type))
-    
-    if user_data_dir == get_user_data_path(browser_type):
-        kill_browser_process(browser_type)
+        co.incognito(is_incognito)
 
-    co.incognito(is_incognito)
+    
     co.set_local_port(port)
 
     page = ChromiumPage(co)
