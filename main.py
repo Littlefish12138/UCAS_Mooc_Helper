@@ -37,7 +37,7 @@ class QtSignalHandler(logging.Handler):
 class WorkerSignals(QObject):
     log = Signal(str)
     finished = Signal(bool, str)
-    need_login = Signal()  # 无痕模式下需要用户登录
+    need_login = Signal()
 
 # ================== 后台工作线程 ==================
 class CourseWorker(QThread):
@@ -45,7 +45,15 @@ class CourseWorker(QThread):
         super().__init__()
         self.config = config
         self.signals = WorkerSignals()
-        self.login_loop = None  # 用于等待登录确认的事件循环
+        self.login_loop = None
+        self._is_stopped = False
+
+    def stop(self):
+        """请求停止线程"""
+        self._is_stopped = True
+        # 如果线程在等待登录，强制退出事件循环
+        if self.login_loop and self.login_loop.isRunning():
+            self.login_loop.quit()
 
     def log_message(self, msg: str, level: str = "INFO"):
         self.signals.log.emit(f"[{level}] {msg}")
@@ -85,13 +93,17 @@ class CourseWorker(QThread):
             self.log_message(f"已打开课程页面: {course_url}")
 
             # 如果是无痕模式，等待用户手动登录
-            if self.config.get("incognito", False):
+            if self.config.get("incognito", False) and not self._is_stopped:
                 self.log_message("无痕模式：请手动登录账号...")
                 self.signals.need_login.emit()
-                # 创建事件循环等待用户确认
                 self.login_loop = QEventLoop()
                 self.login_loop.exec()
+                if self._is_stopped:
+                    return
                 self.log_message("用户已确认登录，继续执行任务")
+
+            if self._is_stopped:
+                return
 
             # 配置 PageConfig
             page_cfg = PageConfig()
@@ -111,6 +123,8 @@ class CourseWorker(QThread):
             )
 
             # 执行任务
+            if self._is_stopped:
+                return
             if self.config["task_type"] == "complete":
                 only_unfinished = self.config.get("only_unfinished", True)
                 video_needed = self.config.get("video_needed", True)
@@ -121,6 +135,8 @@ class CourseWorker(QThread):
                     video_needed=video_needed,
                     question_needed=question_needed
                 )
+                if self._is_stopped:
+                    return
                 if failed:
                     self.signals.finished.emit(False, f"部分任务失败: {failed}")
                 else:
@@ -129,6 +145,8 @@ class CourseWorker(QThread):
                 only_unfinished = self.config.get("only_unfinished", True)
                 self.log_message(f"开始提取章节测试题，仅未完成={only_unfinished}")
                 questions = handler.get_all_questions(only_unfinished=only_unfinished)
+                if self._is_stopped:
+                    return
                 save_path = self.config.get("save_questions_path")
                 if not save_path:
                     raise Exception("保存章节测试题需要指定保存路径")
@@ -145,17 +163,17 @@ class CourseWorker(QThread):
             self.signals.finished.emit(False, str(e))
 
     def _launch_browser(self) -> Optional[ChromiumPage]:
-        mode = self.config.get("browser_mode")  # "edge", "chrome", "manual"
+        mode = self.config.get("browser_mode")
         incognito = self.config.get("incognito", False)
         port = self.config.get("port", 9444)
 
         if mode == "manual":
             try:
-                page = ChromiumPage(addr=f"127.0.0.1:{port}")
+                page = ChromiumPage(port)
                 self.log_message(f"已连接到本地调试端口 {port} 的浏览器")
                 return page
             except Exception as e:
-                self.log_message(f"连接浏览器失败: {e}", "ERROR")
+                self.log_message(f"连接指定端口时出现异常: {e}", "ERROR")
                 return None
         else:
             browser_type = mode
@@ -203,7 +221,7 @@ class MainWindow:
         if not self.window:
             raise RuntimeError("加载 UI 失败")
 
-        # 记录用户是否手动输入过路径（用于自动填充覆盖判断）
+        # 记录用户是否手动输入过路径
         self.browser_path_manual = False
         self.user_data_path_manual = False
 
@@ -212,6 +230,30 @@ class MainWindow:
         self._get_widgets()
         self._init_state()
         self._connect_signals()
+        self._install_close_handler()
+
+    def _install_close_handler(self):
+        """重写窗口关闭事件，处理后台线程"""
+        original_closeEvent = self.window.closeEvent
+
+        def custom_closeEvent(event):
+            if self.worker and self.worker.isRunning():
+                reply = QMessageBox.question(
+                    self.window, "确认退出",
+                    "任务正在执行中，确定要退出吗？退出将中断当前任务。",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.worker.stop()
+                    self.worker.quit()
+                    self.worker.wait(5000)  # 等待最多5秒
+                    event.accept()
+                else:
+                    event.ignore()
+            else:
+                event.accept()
+
+        self.window.closeEvent = custom_closeEvent
 
     def _get_widgets(self):
         # 侧边栏
@@ -270,8 +312,8 @@ class MainWindow:
         self.btn_task.setChecked(True)
         self.stacked_widget.setCurrentIndex(0)
 
-        self.combo_browser_path_mode.setCurrentIndex(0)  # 自动获取
-        self.combo_user_data_path_mode.setCurrentIndex(0)  # 自动获取
+        self.combo_browser_path_mode.setCurrentIndex(0)
+        self.combo_user_data_path_mode.setCurrentIndex(0)
         self.input_browser_path.setReadOnly(True)
         self.input_user_data_path.setReadOnly(True)
 
@@ -334,12 +376,11 @@ class MainWindow:
                 else:
                     self.input_browser_path.clear()
                     QMessageBox.warning(self.window, "提示", f"未能自动获取 {browser_type} 浏览器路径，请手动选择")
-        else:  # 手动选择
+        else:
             if not self.browser_path_manual:
                 self.input_browser_path.clear()
 
     def _refresh_user_data_path(self):
-        # 手动模式下或无痕模式下，禁用整个区域
         if self.radio_manual.isChecked() or self.checkbox_incognito.isChecked():
             self.input_user_data_path.clear()
             self.input_user_data_path.setEnabled(False)
@@ -349,10 +390,8 @@ class MainWindow:
         else:
             self.input_user_data_path.setEnabled(True)
             self.btn_browse_user_data.setEnabled(True)
-            # 当浏览器为 Chrome 时，锁定下拉菜单为手动选择并禁用
             if self.radio_chrome.isChecked():
                 self.combo_user_data_path_mode.setEnabled(False)
-                # 强制设置为手动选择
                 if self.combo_user_data_path_mode.currentIndex() != 1:
                     self.combo_user_data_path_mode.setCurrentIndex(1)
             else:
@@ -368,7 +407,7 @@ class MainWindow:
                 else:
                     self.input_user_data_path.clear()
                     QMessageBox.warning(self.window, "提示", f"未能自动获取 {browser_type} 用户数据目录")
-        else:  # 手动选择
+        else:
             if not self.user_data_path_manual:
                 self.input_user_data_path.clear()
 
@@ -376,10 +415,8 @@ class MainWindow:
     def _on_browser_type_changed(self, checked: bool = True):
         if not checked:
             return
-        
         self._refresh_browser_path()
         self._refresh_user_data_path()
-        # Chrome 非无痕模式时提示用户数据目录必要性
         if self.radio_chrome.isChecked() and not self.checkbox_incognito.isChecked():
             if not self.input_user_data_path.text().strip():
                 QMessageBox.warning(self.window, "Chrome 安全策略",
@@ -436,14 +473,13 @@ class MainWindow:
         self.worker = CourseWorker(config)
         self.worker.signals.log.connect(self._append_log)
         self.worker.signals.finished.connect(self._on_task_finished)
-        self.worker.signals.need_login.connect(self._on_need_login)  # 连接登录信号
+        self.worker.signals.need_login.connect(self._on_need_login)
         self.worker.start()
 
     def _on_need_login(self):
-        """无痕模式下，弹出提示框要求用户登录"""
-        QMessageBox.information(self.window, "登录提示", 
+        """无痕模式登录提示"""
+        QMessageBox.information(self.window, "登录提示",
             "无痕模式：请手动登录您的账号。\n\n登录完成后，点击“确定”继续执行任务。")
-        # 退出子线程中的事件循环
         if self.worker and self.worker.login_loop is not None:
             self.worker.login_loop.quit()
 
