@@ -5,23 +5,34 @@ import json
 import logging
 import traceback
 import warnings
+import re
 from typing import Optional
 from PySide6.QtWidgets import (
-    QApplication, QPushButton, QFrame, QRadioButton, QCheckBox,
+    QApplication, QMainWindow, QPushButton, QFrame, QRadioButton, QCheckBox,
     QLineEdit, QComboBox, QStackedWidget, QFileDialog, QMessageBox,
-    QPlainTextEdit, QWidget
+    QPlainTextEdit, QWidget, QButtonGroup
 )
-from PySide6.QtUiTools import QUiLoader
-from PySide6.QtCore import QFile, QIODevice, QObject, Signal, QThread, QEventLoop
+from PySide6.QtCore import QObject, Signal, QThread, QEventLoop
 from PySide6.QtGui import QTextCursor
 
 # 忽略 Qt 样式表警告（box-shadow 等）
 warnings.filterwarnings("ignore", message=".*Unknown property.*")
 
-import resources_rc  # 资源文件
+import resources_rc  # 确保资源加载（ui_main.py 也会导入，但保留不影响）
 import utils
 from course_listener import CourseHandler, PageConfig
 from DrissionPage import ChromiumPage
+
+# 导入生成的 UI 类
+from ui_main import Ui_MainWindow
+
+# ================== 日志等级映射 ==================
+LOG_LEVEL_MAP = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARNING": 30,
+    "CRITICAL": 40,
+}
 
 # ================== 日志处理器 ==================
 class QtSignalHandler(logging.Handler):
@@ -37,7 +48,7 @@ class QtSignalHandler(logging.Handler):
 class WorkerSignals(QObject):
     log = Signal(str)
     finished = Signal(bool, str)
-    need_login = Signal()
+    need_login = Signal()  # 无痕模式下需要用户登录
 
 # ================== 后台工作线程 ==================
 class CourseWorker(QThread):
@@ -45,15 +56,7 @@ class CourseWorker(QThread):
         super().__init__()
         self.config = config
         self.signals = WorkerSignals()
-        self.login_loop = None
-        self._is_stopped = False
-
-    def stop(self):
-        """请求停止线程"""
-        self._is_stopped = True
-        # 如果线程在等待登录，强制退出事件循环
-        if self.login_loop and self.login_loop.isRunning():
-            self.login_loop.quit()
+        self.login_loop = None  # 用于等待登录确认的事件循环
 
     def log_message(self, msg: str, level: str = "INFO"):
         self.signals.log.emit(f"[{level}] {msg}")
@@ -93,17 +96,13 @@ class CourseWorker(QThread):
             self.log_message(f"已打开课程页面: {course_url}")
 
             # 如果是无痕模式，等待用户手动登录
-            if self.config.get("incognito", False) and not self._is_stopped:
+            if self.config.get("incognito", False):
                 self.log_message("无痕模式：请手动登录账号...")
                 self.signals.need_login.emit()
+                # 创建事件循环等待用户确认
                 self.login_loop = QEventLoop()
                 self.login_loop.exec()
-                if self._is_stopped:
-                    return
                 self.log_message("用户已确认登录，继续执行任务")
-
-            if self._is_stopped:
-                return
 
             # 配置 PageConfig
             page_cfg = PageConfig()
@@ -123,8 +122,6 @@ class CourseWorker(QThread):
             )
 
             # 执行任务
-            if self._is_stopped:
-                return
             if self.config["task_type"] == "complete":
                 only_unfinished = self.config.get("only_unfinished", True)
                 video_needed = self.config.get("video_needed", True)
@@ -135,8 +132,6 @@ class CourseWorker(QThread):
                     video_needed=video_needed,
                     question_needed=question_needed
                 )
-                if self._is_stopped:
-                    return
                 if failed:
                     self.signals.finished.emit(False, f"部分任务失败: {failed}")
                 else:
@@ -145,8 +140,6 @@ class CourseWorker(QThread):
                 only_unfinished = self.config.get("only_unfinished", True)
                 self.log_message(f"开始提取章节测试题，仅未完成={only_unfinished}")
                 questions = handler.get_all_questions(only_unfinished=only_unfinished)
-                if self._is_stopped:
-                    return
                 save_path = self.config.get("save_questions_path")
                 if not save_path:
                     raise Exception("保存章节测试题需要指定保存路径")
@@ -163,17 +156,17 @@ class CourseWorker(QThread):
             self.signals.finished.emit(False, str(e))
 
     def _launch_browser(self) -> Optional[ChromiumPage]:
-        mode = self.config.get("browser_mode")
+        mode = self.config.get("browser_mode")  # "edge", "chrome", "manual"
         incognito = self.config.get("incognito", False)
         port = self.config.get("port", 9444)
 
         if mode == "manual":
             try:
-                page = ChromiumPage(port)
+                page = ChromiumPage(addr=f"127.0.0.1:{port}")
                 self.log_message(f"已连接到本地调试端口 {port} 的浏览器")
                 return page
             except Exception as e:
-                self.log_message(f"连接指定端口时出现异常: {e}", "ERROR")
+                self.log_message(f"连接浏览器失败: {e}", "ERROR")
                 return None
         else:
             browser_type = mode
@@ -201,7 +194,7 @@ class CourseWorker(QThread):
 
     def _get_logger(self):
         logger = logging.getLogger("CourseWorker")
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG)
         if not any(isinstance(h, QtSignalHandler) for h in logger.handlers):
             handler = QtSignalHandler(self.signals.log)
             handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", "%H:%M:%S"))
@@ -209,111 +202,84 @@ class CourseWorker(QThread):
         return logger
 
 # ================== 主窗口 ==================
-class MainWindow:
-    def __init__(self, ui_file="mainwindow.ui"):
-        self.loader = QUiLoader()
-        ui_file_path = os.path.join(os.path.dirname(__file__), ui_file)
-        ui_file = QFile(ui_file_path)
-        if not ui_file.open(QIODevice.ReadOnly):
-            raise RuntimeError(f"无法打开 UI 文件: {ui_file_path}")
-        self.window = self.loader.load(ui_file)
-        ui_file.close()
-        if not self.window:
-            raise RuntimeError("加载 UI 失败")
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)  # 初始化界面
 
-        # 记录用户是否手动输入过路径
+        # 记录用户是否手动输入过路径（用于自动填充覆盖判断）
         self.browser_path_manual = False
         self.user_data_path_manual = False
 
         self.worker = None
+        self.current_log_level = 20  # INFO
 
+        # 获取控件引用（直接使用 self.ui 下的属性）
         self._get_widgets()
+
         self._init_state()
         self._connect_signals()
-        self._install_close_handler()
-
-    def _install_close_handler(self):
-        """重写窗口关闭事件，处理后台线程"""
-        original_closeEvent = self.window.closeEvent
-
-        def custom_closeEvent(event):
-            if self.worker and self.worker.isRunning():
-                reply = QMessageBox.question(
-                    self.window, "确认退出",
-                    "任务正在执行中，确定要退出吗？退出将中断当前任务。",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-                )
-                if reply == QMessageBox.Yes:
-                    self.worker.stop()
-                    self.worker.quit()
-                    self.worker.wait(5000)  # 等待最多5秒
-                    event.accept()
-                else:
-                    event.ignore()
-            else:
-                event.accept()
-
-        self.window.closeEvent = custom_closeEvent
 
     def _get_widgets(self):
         # 侧边栏
-        self.btn_task = self.window.findChild(QPushButton, "btn_task")
-        self.btn_settings = self.window.findChild(QPushButton, "btn_settings")
-        self.stacked_widget = self.window.findChild(QStackedWidget, "stackedWidget")
+        self.btn_task = self.ui.btn_task
+        self.btn_settings = self.ui.btn_settings
+        self.stacked_widget = self.ui.stackedWidget
 
         # 任务页面控件
-        self.input_course_url = self.window.findChild(QLineEdit, "input_course_url")
-        self.radio_complete_course = self.window.findChild(QRadioButton, "radio_complete_course")
-        self.radio_save_questions = self.window.findChild(QRadioButton, "radio_save_questions")
-        self.checkbox_only_unfinished_course = self.window.findChild(QCheckBox, "checkbox_only_unfinished_course")
-        self.checkbox_complete_test = self.window.findChild(QCheckBox, "checkbox_complete_test")
-        self.checkbox_watch_video = self.window.findChild(QCheckBox, "checkbox_watch_video")
-        self.checkbox_only_unfinished_save = self.window.findChild(QCheckBox, "checkbox_only_unfinished_save")
+        self.input_course_url = self.ui.input_course_url
+        self.radio_complete_course = self.ui.radio_complete_course
+        self.radio_save_questions = self.ui.radio_save_questions
+        self.checkbox_only_unfinished_course = self.ui.checkbox_only_unfinished_course
+        self.checkbox_complete_test = self.ui.checkbox_complete_test
+        self.checkbox_watch_video = self.ui.checkbox_watch_video
+        self.checkbox_only_unfinished_save = self.ui.checkbox_only_unfinished_save
 
         # 查找器配置
-        self.input_page_config_path = self.window.findChild(QLineEdit, "input_page_config_path")
-        self.btn_browse_page_config = self.window.findChild(QPushButton, "btn_browse_page_config")
-        self.input_answer_path = self.window.findChild(QLineEdit, "input_answer_path")
-        self.btn_browse_answer_config = self.window.findChild(QPushButton, "btn_browse_answer_config")
-        self.input_save_path = self.window.findChild(QLineEdit, "input_save_path")
-        self.btn_browse_save_path = self.window.findChild(QPushButton, "icon_folder")
+        self.input_page_config_path = self.ui.input_page_config_path
+        self.btn_browse_page_config = self.ui.btn_browse_page_config
+        self.input_answer_path = self.ui.input_answer_path
+        self.btn_browse_answer_config = self.ui.btn_browse_answer_config
+        self.input_save_path = self.ui.input_save_path
+        self.btn_browse_save_path = self.ui.icon_folder
 
         # 浏览器配置
-        self.radio_edge = self.window.findChild(QRadioButton, "radio_edge")
-        self.radio_chrome = self.window.findChild(QRadioButton, "radio_chrome")
-        self.radio_manual = self.window.findChild(QRadioButton, "radio_manual")
-        self.checkbox_incognito = self.window.findChild(QCheckBox, "checkbox_incognito")
+        self.radio_edge = self.ui.radio_edge
+        self.radio_chrome = self.ui.radio_chrome
+        self.radio_manual = self.ui.radio_manual
+        self.checkbox_incognito = self.ui.checkbox_incognito
 
-        self.combo_browser_path_mode = self.window.findChild(QComboBox, "combo_browser_path_mode")
-        self.input_browser_path = self.window.findChild(QLineEdit, "input_browser_path")
-        self.btn_browse_browser = self.window.findChild(QPushButton, "btn_browse_browser")
+        self.combo_browser_path_mode = self.ui.combo_browser_path_mode
+        self.input_browser_path = self.ui.input_browser_path
+        self.btn_browse_browser = self.ui.btn_browse_browser
 
-        self.combo_user_data_path_mode = self.window.findChild(QComboBox, "combo_user_data_path_mode")
-        self.input_user_data_path = self.window.findChild(QLineEdit, "input_user_data_path")
-        self.btn_browse_user_data = self.window.findChild(QPushButton, "btn_browse_user_data")
+        self.combo_user_data_path_mode = self.ui.combo_user_data_path_mode
+        self.input_user_data_path = self.ui.input_user_data_path
+        self.btn_browse_user_data = self.ui.btn_browse_user_data
 
-        self.input_port = self.window.findChild(QLineEdit, "input_port")
+        self.input_port = self.ui.input_port
 
         # 开始按钮
-        self.btn_start_task = self.window.findChild(QPushButton, "btn_start_task")
+        self.btn_start_task = self.ui.btn_start_task
 
         # 设置页面控件
-        self.input_listen_timeout = self.window.findChild(QLineEdit, "input_listen_timeout")
-        self.input_complete_image_keyword = self.window.findChild(QLineEdit, "input_complete_image_keyword")
-        self.input_load_timeout = self.window.findChild(QLineEdit, "input_load_timeout")
-        self.input_locate_timeout = self.window.findChild(QLineEdit, "input_locate_timeout")
-        self.input_page_load_time = self.window.findChild(QLineEdit, "input_page_load_time")
+        self.input_listen_timeout = self.ui.input_listen_timeout
+        self.input_complete_image_keyword = self.ui.input_complete_image_keyword
+        self.input_load_timeout = self.ui.input_load_timeout
+        self.input_locate_timeout = self.ui.input_locate_timeout
+        self.input_page_load_time = self.ui.input_page_load_time
 
         # 日志
-        self.text_log = self.window.findChild(QPlainTextEdit, "text_log")
-        self.combo_log_level = self.window.findChild(QComboBox, "combo_log_level")
+        self.text_log = self.ui.text_log
+        self.combo_log_level = self.ui.combo_log_level
 
     def _init_state(self):
         self.btn_task.setChecked(True)
         self.stacked_widget.setCurrentIndex(0)
 
-        self.combo_browser_path_mode.setCurrentIndex(0)
-        self.combo_user_data_path_mode.setCurrentIndex(0)
+        self.combo_browser_path_mode.setCurrentIndex(0)  # 自动获取
+        self.combo_user_data_path_mode.setCurrentIndex(0)  # 自动获取
         self.input_browser_path.setReadOnly(True)
         self.input_user_data_path.setReadOnly(True)
 
@@ -321,6 +287,10 @@ class MainWindow:
         self._refresh_user_data_path()
         self._on_browser_type_changed(True)
         self._on_incognito_changed()
+
+        # 设置初始日志等级（INFO）
+        self.combo_log_level.setCurrentText("INFO")
+        self.current_log_level = LOG_LEVEL_MAP.get("INFO", 20)
 
     def _connect_signals(self):
         # 侧边栏
@@ -353,6 +323,13 @@ class MainWindow:
         # 开始任务
         self.btn_start_task.clicked.connect(self._on_start_clicked)
 
+        # 日志等级切换
+        self.combo_log_level.currentTextChanged.connect(self._on_log_level_changed)
+
+    # ------------------ 日志等级 ------------------
+    def _on_log_level_changed(self, level_text: str):
+        self.current_log_level = LOG_LEVEL_MAP.get(level_text, 20)
+
     # ------------------ 路径填充逻辑 ------------------
     def _refresh_browser_path(self):
         if self.radio_manual.isChecked():
@@ -375,12 +352,13 @@ class MainWindow:
                     self.input_browser_path.setText(path)
                 else:
                     self.input_browser_path.clear()
-                    QMessageBox.warning(self.window, "提示", f"未能自动获取 {browser_type} 浏览器路径，请手动选择")
-        else:
+                    QMessageBox.warning(self, "提示", f"未能自动获取 {browser_type} 浏览器路径，请手动选择")
+        else:  # 手动选择
             if not self.browser_path_manual:
                 self.input_browser_path.clear()
 
     def _refresh_user_data_path(self):
+        # 手动模式下或无痕模式下，禁用整个区域
         if self.radio_manual.isChecked() or self.checkbox_incognito.isChecked():
             self.input_user_data_path.clear()
             self.input_user_data_path.setEnabled(False)
@@ -390,8 +368,10 @@ class MainWindow:
         else:
             self.input_user_data_path.setEnabled(True)
             self.btn_browse_user_data.setEnabled(True)
+            # 当浏览器为 Chrome 时，锁定下拉菜单为手动选择并禁用
             if self.radio_chrome.isChecked():
                 self.combo_user_data_path_mode.setEnabled(False)
+                # 强制设置为手动选择
                 if self.combo_user_data_path_mode.currentIndex() != 1:
                     self.combo_user_data_path_mode.setCurrentIndex(1)
             else:
@@ -406,8 +386,8 @@ class MainWindow:
                     self.input_user_data_path.setText(path)
                 else:
                     self.input_user_data_path.clear()
-                    QMessageBox.warning(self.window, "提示", f"未能自动获取 {browser_type} 用户数据目录")
-        else:
+                    QMessageBox.warning(self, "提示", f"未能自动获取 {browser_type} 用户数据目录")
+        else:  # 手动选择
             if not self.user_data_path_manual:
                 self.input_user_data_path.clear()
 
@@ -415,18 +395,20 @@ class MainWindow:
     def _on_browser_type_changed(self, checked: bool = True):
         if not checked:
             return
+
         self._refresh_browser_path()
         self._refresh_user_data_path()
+        # Chrome 非无痕模式时提示用户数据目录必要性
         if self.radio_chrome.isChecked() and not self.checkbox_incognito.isChecked():
             if not self.input_user_data_path.text().strip():
-                QMessageBox.warning(self.window, "Chrome 安全策略",
+                QMessageBox.warning(self, "Chrome 安全策略",
                     "Chrome 非无痕模式下，必须指定一个专用的用户数据目录。\n请手动选择一个目录或勾选无痕模式。")
 
     def _on_incognito_changed(self):
         self._refresh_user_data_path()
         if self.radio_chrome.isChecked() and not self.checkbox_incognito.isChecked():
             if not self.input_user_data_path.text().strip():
-                QMessageBox.warning(self.window, "Chrome 安全策略",
+                QMessageBox.warning(self, "Chrome 安全策略",
                     "Chrome 非无痕模式下，必须指定一个专用的用户数据目录。")
 
     def _on_browser_path_mode_changed(self):
@@ -437,26 +419,26 @@ class MainWindow:
 
     # ------------------ 文件选择 ------------------
     def _browse_json_file(self, line_edit: QLineEdit):
-        file_path, _ = QFileDialog.getOpenFileName(self.window, "选择 JSON 文件", "", "JSON 文件 (*.json)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择 JSON 文件", "", "JSON 文件 (*.json)")
         if file_path:
             line_edit.setText(file_path)
 
     def _browse_save_file(self):
         current = self.input_save_path.text().strip()
-        file_path, _ = QFileDialog.getSaveFileName(self.window, "保存章节测试题", current, "JSON 文件 (*.json)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "保存章节测试题", current, "JSON 文件 (*.json)")
         if file_path:
             if not file_path.lower().endswith(".json"):
                 file_path += ".json"
             self.input_save_path.setText(file_path)
 
     def _browse_browser_executable(self):
-        file_path, _ = QFileDialog.getOpenFileName(self.window, "选择浏览器可执行文件", "", "可执行文件 (*.exe)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择浏览器可执行文件", "", "可执行文件 (*.exe)")
         if file_path:
             self.input_browser_path.setText(file_path)
             self.browser_path_manual = True
 
     def _browse_user_data_directory(self):
-        directory = QFileDialog.getExistingDirectory(self.window, "选择用户数据目录")
+        directory = QFileDialog.getExistingDirectory(self, "选择用户数据目录")
         if directory:
             self.input_user_data_path.setText(directory)
             self.user_data_path_manual = True
@@ -477,8 +459,8 @@ class MainWindow:
         self.worker.start()
 
     def _on_need_login(self):
-        """无痕模式登录提示"""
-        QMessageBox.information(self.window, "登录提示",
+        """无痕模式下，弹出提示框要求用户登录"""
+        QMessageBox.information(self, "登录提示",
             "无痕模式：请手动登录您的账号。\n\n登录完成后，点击“确定”继续执行任务。")
         if self.worker and self.worker.login_loop is not None:
             self.worker.login_loop.quit()
@@ -489,27 +471,27 @@ class MainWindow:
 
         course_url = self.input_course_url.text().strip()
         if not course_url:
-            QMessageBox.warning(self.window, "错误", "课程链接不能为空")
+            QMessageBox.warning(self, "错误", "课程链接不能为空")
             return None
         config["course_url"] = course_url
 
         page_config_path = self.input_page_config_path.text().strip()
         if not page_config_path or not os.path.exists(page_config_path):
-            QMessageBox.warning(self.window, "错误", "页面配置 JSON 文件不存在或未指定")
+            QMessageBox.warning(self, "错误", "页面配置 JSON 文件不存在或未指定")
             return None
         config["page_config_path"] = page_config_path
 
         if task_type == "complete" and self.checkbox_complete_test.isChecked():
             answer_path = self.input_answer_path.text().strip()
             if not answer_path or not os.path.exists(answer_path):
-                QMessageBox.warning(self.window, "错误", "完成章节测试题需要提供有效的答案 JSON 文件")
+                QMessageBox.warning(self, "错误", "完成章节测试题需要提供有效的答案 JSON 文件")
                 return None
             config["answer_path"] = answer_path
 
         if task_type == "save":
             save_path = self.input_save_path.text().strip()
             if not save_path:
-                file_path, _ = QFileDialog.getSaveFileName(self.window, "保存章节测试题", "", "JSON 文件 (*.json)")
+                file_path, _ = QFileDialog.getSaveFileName(self, "保存章节测试题", "", "JSON 文件 (*.json)")
                 if not file_path:
                     return None
                 if not file_path.lower().endswith(".json"):
@@ -532,7 +514,7 @@ class MainWindow:
 
         if config["browser_mode"] == "chrome" and not config["incognito"]:
             if not config["user_data_dir"]:
-                QMessageBox.warning(self.window, "错误", "Chrome 非无痕模式下，必须指定一个专用的用户数据目录")
+                QMessageBox.warning(self, "错误", "Chrome 非无痕模式下，必须指定一个专用的用户数据目录")
                 return None
 
         config["listen_timeout"] = int(self.input_listen_timeout.text().strip() or "3600")
@@ -551,27 +533,32 @@ class MainWindow:
         return config
 
     def _append_log(self, msg):
-        self.text_log.appendPlainText(msg)
-        cursor = self.text_log.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.text_log.setTextCursor(cursor)
+        """显示日志，并根据日志等级过滤"""
+        match = re.match(r"^\[(\w+)\]", msg)
+        if match:
+            level = match.group(1)
+            level_value = LOG_LEVEL_MAP.get(level, 20)
+        else:
+            level_value = 20
+        if level_value >= self.current_log_level:
+            self.text_log.appendPlainText(msg)
+            cursor = self.text_log.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.text_log.setTextCursor(cursor)
 
     def _on_task_finished(self, success: bool, message: str):
         self.btn_start_task.setEnabled(True)
         self.btn_start_task.setText("开始任务")
         if success:
             self._append_log(f"✅ {message}")
-            QMessageBox.information(self.window, "完成", message)
+            QMessageBox.information(self, "完成", message)
         else:
             self._append_log(f"❌ 任务失败: {message}")
-            QMessageBox.critical(self.window, "失败", f"任务执行失败:\n{message}")
-
-    def show(self):
-        self.window.show()
+            QMessageBox.critical(self, "失败", f"任务执行失败:\n{message}")
 
 def main():
     app = QApplication(sys.argv)
-    main_win = MainWindow("mainwindow.ui")
+    main_win = MainWindow()
     main_win.show()
     sys.exit(app.exec())
 

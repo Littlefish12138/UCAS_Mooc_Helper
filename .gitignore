@@ -5,3 +5,5 @@ venv/
 build/
 .gitignore
 .vscode/
+resources_rc.py
+ui_main.py
