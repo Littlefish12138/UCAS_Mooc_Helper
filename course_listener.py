@@ -159,8 +159,16 @@ class CourseHandler:
         :param video_play: 视频的播放方法
         """
         result = self._elem_locator.extract_info({'video_play'})
-        video_play = result.get('video_play')
-        if video_play and callable(video_play):
+        video_list: list | None = result.get('video')
+        if video_list:
+            try:
+                video_play = video_list[0].get('video_play')
+                if not callable(video_play):
+                    self.logger.critical(f"似乎获取到了无效的播放回调, 提取结果{result}")
+                    return
+            except Exception as e:
+                self.logger.critical(f"获取视频播放回调时出现异常{e}, 提取结果为{result}")
+                return
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(self._listen_complete_image)
                 
@@ -171,7 +179,7 @@ class CourseHandler:
                 
                 return future.result()
         else:
-            self.logger.critical(f"获取视频播放方法时异常, 获取结果: {result}")
+            self.logger.critical(f"尝试提取视频播放回调时出现异常: 似乎没有任何结果. 提取结果: {result}")
             return
 
     def finish_questions(self):
